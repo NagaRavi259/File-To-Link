@@ -10,14 +10,40 @@ from urllib.parse import quote_plus
 from pyrogram import filters, Client
 from pyrogram.errors import FloodWait, UserNotParticipant
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
-
 from Adarsh.utils.file_properties import get_name, get_hash, get_media_file_size
-db = Database(Var.DATABASE_URL, Var.name)
+import logging
+import sys
+
+try:
+    loop = asyncio.get_event_loop()
+    db = Database(Var.DATABASE_URL, Var.name)
+    if loop.is_running():
+        # If the event loop is already running, schedule the task in it
+        task = loop.create_task(db.initialize())
+        # Optionally, handle exceptions inside the task
+        task.add_done_callback(
+            lambda t: t.exception() and logging.critical(f"Database initialization error: {t.exception()}")
+        )
+except Exception as e:
+    logging.critical(f"Critical error occurred during database initialization: {e}")
+    sys.exit(1)  # Force exit the program if database initialization fails
 
 
 MY_PASS = os.environ.get("MY_PASS",None)
 pass_dict = {}
-pass_db = Database(Var.DATABASE_URL, "ag_passwords")
+try:
+    loop = asyncio.get_event_loop()
+    pass_db = Database(Var.DATABASE_URL, "ag_passwords")
+    if loop.is_running():
+        # If the event loop is already running, schedule the task in it
+        task = loop.create_task(pass_db.initialize())
+        # Optionally, handle exceptions inside the task
+        task.add_done_callback(
+            lambda t: t.exception() and logging.critical(f"Database initialization error: {t.exception()}")
+        )
+except Exception as e:
+    logging.critical(f"Critical error occurred during database initialization: {e}")
+    sys.exit(1)  # Force exit the program if database initialization fails
 
 
 @StreamBot.on_message((filters.regex("login🔑") | filters.command("login")) , group=4)
@@ -70,7 +96,7 @@ async def private_receive_handler(c: Client, m: Message):
                     text="𝚈𝙾𝚄 𝙰𝚁𝙴 𝙱𝙰𝙽𝙽𝙴𝙳../**",
                     disable_web_page_preview=True
                 )
-                return 
+                return
         except UserNotParticipant:
             await c.send_message(
                 chat_id=m.chat.id,
@@ -88,19 +114,23 @@ async def private_receive_handler(c: Client, m: Message):
             await m.reply_text(e)
             await c.send_message(
                 chat_id=m.chat.id,
-                text="**𝙰𝙳𝙳 𝙵𝙾𝚁𝙲𝙴 𝚂𝚄𝙱 𝚃𝙾 𝙰𝙽𝚈 𝙲𝙷𝙰𝙽𝙽𝙴𝙻**",
+                text='\n🎉 Welcome to the Ultimate Test Bot! 🎉**\n\n🔹 **Enjoy All Features for FREE!**\n🔹 **No Ads, No Subscription!**\n\n**📁 How to Use:**\n\n1. **Forward a File** to this bot.\n2. **Receive a Link** to **Stream** or **Download** your file instantly!\n\n**💡 Key Features:**\n\n- **Completely Ad-Free Experience** 🚫\n- **No Subscription Required** 🎟️\n- **Fast & Easy File Sharing** 📤',
                 disable_web_page_preview=True)
             return
     try:
 
         log_msg = await m.forward(chat_id=Var.BIN_CHANNEL)
-        stream_link = f"{Var.URL}watch/{str(log_msg.id)}/{quote_plus(get_name(log_msg))}?hash={get_hash(log_msg)}"
-        
-        online_link = f"{Var.URL}{str(log_msg.id)}/{quote_plus(get_name(log_msg))}?hash={get_hash(log_msg)}"
-        
+        # stream_link = f"{Var.URL}watch/{str(log_msg.id)}/{quote_plus(get_name(log_msg))}?hash={get_hash(log_msg)}"
+
+        # online_link = f"{Var.URL}{str(log_msg.id)}/{quote_plus(get_name(log_msg))}?hash={get_hash(log_msg)}"
+
+        stream_link = f"{Var.URL}watch/{str(log_msg.id)}/?hash={get_hash(log_msg)}"
+
+        online_link = f"{Var.URL}{str(log_msg.id)}/?hash={get_hash(log_msg)}"
+
         photo_xr="https://telegra.ph/file/3cd15a67ad7234c2945e7.jpg"
-        
-        
+
+
 
         msg_text ="""
 <b>ʏᴏᴜʀ ʟɪɴᴋ ɪs ɢᴇɴᴇʀᴀᴛᴇᴅ...⚡
@@ -117,9 +147,9 @@ async def private_receive_handler(c: Client, m: Message):
 
         await log_msg.reply_text(text=f"**RᴇQᴜᴇꜱᴛᴇᴅ ʙʏ :** [{m.from_user.first_name}](tg://user?id={m.from_user.id})\n**Uꜱᴇʀ ɪᴅ :** `{m.from_user.id}`\n**Stream ʟɪɴᴋ :** {stream_link}", disable_web_page_preview=True, quote=True)
         await m.reply_text(
-            
+
             text=msg_text.format(get_name(log_msg), humanbytes(get_media_file_size(m)), online_link, stream_link),
-            
+
             quote=True,
             disable_web_page_preview=True,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚡ ᴡᴀᴛᴄʜ ⚡", url=stream_link), #Stream Link
@@ -147,7 +177,7 @@ async def channel_receive_handler(bot, broadcast):
         return
     try:
         log_msg = await broadcast.forward(chat_id=Var.BIN_CHANNEL)
-        stream_link = f"{Var.URL}watch/{str(log_msg.id)}/{quote_plus(get_name(log_msg))}?hash={get_hash(log_msg)}"       
+        stream_link = f"{Var.URL}watch/{str(log_msg.id)}/{quote_plus(get_name(log_msg))}?hash={get_hash(log_msg)}"
         online_link = f"{Var.URL}{str(log_msg.id)}/{quote_plus(get_name(log_msg))}?hash={get_hash(log_msg)}"
         await log_msg.reply_text(
             text=f"**Cʜᴀɴɴᴇʟ Nᴀᴍᴇ:** `{broadcast.chat.title}`\n**Cʜᴀɴɴᴇʟ ID:** `{broadcast.chat.id}`\n**Rᴇǫᴜᴇsᴛ ᴜʀʟ:** {stream_link}",
@@ -159,7 +189,7 @@ async def channel_receive_handler(bot, broadcast):
             reply_markup=InlineKeyboardMarkup(
                 [
                     [InlineKeyboardButton("⚡ ᴡᴀᴛᴄʜ ⚡", url=stream_link),
-                     InlineKeyboardButton('⚡ ᴅᴏᴡɴʟᴏᴀᴅ ⚡', url=online_link)] 
+                     InlineKeyboardButton('⚡ ᴅᴏᴡɴʟᴏᴀᴅ ⚡', url=online_link)]
                 ]
             )
         )

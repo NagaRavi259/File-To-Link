@@ -4,29 +4,54 @@ import sys
 import glob
 import asyncio
 import logging
+import datetime
+from logging.handlers import RotatingFileHandler
 import importlib
 from pathlib import Path
 from pyrogram import idle
 from .bot import StreamBot
 from .vars import Var
-from aiohttp import web
-from .server import web_server
+import uvicorn
+from .server import app  # Import FastAPI app instance
 from .utils.keepalive import ping_server
 from Adarsh.bot.clients import initialize_clients
 
+# Generate a timestamp
+timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+
+# Set up the logging configuration with a timestamped filename
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        RotatingFileHandler(
+            f'logs/log_{timestamp}.log',  # Dynamic filename with timestamp
+            # maxBytes=1000000,  # Max size in bytes before rotating
+            backupCount=5,  # Number of backup files to keep
+            encoding='utf-8'  # Ensure correct file encoding
+        )
+    ]
 )
-logging.getLogger("aiohttp").setLevel(logging.ERROR)
-logging.getLogger("pyrogram").setLevel(logging.ERROR)
-logging.getLogger("aiohttp.web").setLevel(logging.ERROR)
+
+log_level = logging.ERROR
+# Setting logging levels for specific modules
+logging.getLogger("fastapi").setLevel(log_level)
+logging.getLogger("starlette").setLevel(log_level)
+logging.getLogger("uvicorn").setLevel(log_level)
+logging.getLogger("uvicorn.access").setLevel(log_level)
+logging.getLogger("uvicorn.error").setLevel(log_level)
+
+# Setting DEBUG level for Pyrogram, which is a Telegram client library
+logging.getLogger("pyrogram").setLevel(log_level)
+
+# Example of logging usage
+logging.info("Logging system with RotatingFileHandler is set up and ready.")
 
 ppath = "Adarsh/bot/plugins/*.py"
 files = glob.glob(ppath)
 StreamBot.start()
 loop = asyncio.get_event_loop()
-
 
 async def start_services():
     print('\n')
@@ -58,10 +83,10 @@ async def start_services():
         print()
         asyncio.create_task(ping_server())
     print('-------------------- Initalizing Web Server -------------------------')
-    app = web.AppRunner(await web_server())
-    await app.setup()
-    bind_address = ".railway.app" if Var.ON_HEROKU else Var.BIND_ADRESS
-    await web.TCPSite(app, bind_address, Var.PORT).start()
+    # Use uvicorn to run FastAPI app
+    config = uvicorn.Config(app, host=Var.BIND_ADRESS, port=Var.PORT, log_level="debug")
+    server = uvicorn.Server(config)
+    asyncio.create_task(server.serve())
     print('----------------------------- DONE ---------------------------------------------------------------------')
     print('\n')
     print('---------------------------------------------------------------------------------------------------------')
@@ -71,7 +96,7 @@ async def start_services():
     print('\n')
     print('----------------------- Service Started -----------------------------------------------------------------')
     print('                        bot =>> {}'.format((await StreamBot.get_me()).first_name))
-    print('                        server ip =>> {}:{}'.format(bind_address, Var.PORT))
+    print('                        server ip =>> {}:{}'.format(Var.BIND_ADRESS, Var.PORT))
     print('                        Owner =>> {}'.format((Var.OWNER_USERNAME)))
     if Var.ON_HEROKU:
         print('                        app runnng on =>> {}'.format(Var.FQDN))

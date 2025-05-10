@@ -4,11 +4,12 @@
 import re
 import time
 import math
+import traceback
 import logging
 import secrets
 import mimetypes
-from aiohttp import web
-from aiohttp.http_exceptions import BadStatusLine
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from Adarsh.bot import multi_clients, work_loads, StreamBot
 from Adarsh.server.exceptions import FIleNotFound, InvalidHash
 from Adarsh import StartTime, __version__
@@ -16,14 +17,15 @@ from ..utils.time_format import get_readable_time
 from ..utils.custom_dl import ByteStreamer, offset_fix, chunk_size
 from Adarsh.utils.render_template import render_page
 from Adarsh.vars import Var
+from datetime import datetime
 
+router = APIRouter()
 
-routes = web.RouteTableDef()
-
-@routes.get("/", allow_head=True)
-async def root_route_handler(_):
-    return web.json_response(
-        {
+# Root route for server status
+@router.get("/", response_class=JSONResponse)
+async def root_route_handler():
+    return JSONResponse(
+        content={
             "server_status": "running",
             "uptime": get_readable_time(time.time() - StartTime),
             "telegram_bot": "@" + StreamBot.username,
@@ -38,61 +40,64 @@ async def root_route_handler(_):
         }
     )
 
-
-@routes.get(r"/watch/{path:\S+}", allow_head=True)
-async def stream_handler(request: web.Request):
+@router.get("/watch/{path:path}", response_class=HTMLResponse)
+async def stream_handler(request: Request, path: str):
     try:
-        path = request.match_info["path"]
         match = re.search(r"^([a-zA-Z0-9_-]{6})(\d+)$", path)
         if match:
             secure_hash = match.group(1)
             id = int(match.group(2))
         else:
-            id = int(re.search(r"(\d+)(?:\/\S+)?", path).group(1))
-            secure_hash = request.rel_url.query.get("hash")
-        return web.Response(text=await render_page(id, secure_hash), content_type='text/html')
+            id = int(re.search(r"(\d+)(?:/\S+)?", path).group(1))
+            secure_hash = request.query_params.get("hash")
+        return HTMLResponse(content=await render_page(id, secure_hash))
     except InvalidHash as e:
-        raise web.HTTPForbidden(text=e.message)
+        raise HTTPException(status_code=403, detail=e.message)
     except FIleNotFound as e:
-        raise web.HTTPNotFound(text=e.message)
-    except (AttributeError, BadStatusLine, ConnectionResetError):
-        pass
+        raise HTTPException(status_code=404, detail=e.message)
     except Exception as e:
         logging.critical(e.with_traceback(None))
-        raise web.HTTPInternalServerError(text=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
-@routes.get(r"/{path:\S+}", allow_head=True)
-async def stream_handler(request: web.Request):
+@router.get("/{path:path}")
+async def stream_handler(request: Request, path: str):
     try:
-        path = request.match_info["path"]
         match = re.search(r"^([a-zA-Z0-9_-]{6})(\d+)$", path)
         if match:
             secure_hash = match.group(1)
             id = int(match.group(2))
         else:
-            id = int(re.search(r"(\d+)(?:\/\S+)?", path).group(1))
-            secure_hash = request.rel_url.query.get("hash")
+            # id = int(re.search(r"(\d+)(?:/\S+)?", path).group(1))
+            match = re.search(r"(\d+)(?:/(\S+))?", path)
+            if match:
+                id = int(match.group(1))
+                secure_hash = request.query_params.get("hash")
+            else:
+                raise HTTPException(status_code=400, detail="Invalid path format")
+            # secure_hash = request.query_params.get("hash")
         return await media_streamer(request, id, secure_hash)
     except InvalidHash as e:
-        raise web.HTTPForbidden(text=e.message)
+        raise HTTPException(status_code=403, detail=e.message)
     except FIleNotFound as e:
-        raise web.HTTPNotFound(text=e.message)
-    except (AttributeError, BadStatusLine, ConnectionResetError):
-        pass
+        raise HTTPException(status_code=404, detail=e.message)
     except Exception as e:
+        print(e)
+        # Get the traceback and extract the line number
+        traceback_details = traceback.format_exc()
+        print(f"Traceback details:\n{traceback_details}")
         logging.critical(e.with_traceback(None))
-        raise web.HTTPInternalServerError(text=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 class_cache = {}
 
-async def media_streamer(request: web.Request, id: int, secure_hash: str):
-    range_header = request.headers.get("Range", 0)
-    
+async def media_streamer(request: Request, id: int, secure_hash: str):
+    range_header = request.headers.get("range", 0)
+    # Get the index of the faster client
     index = min(work_loads, key=work_loads.get)
     faster_client = multi_clients[index]
-    
+
     if Var.MULTI_CLIENT:
-        logging.info(f"Client {index} is now serving {request.remote}")
+        logging.info(f"Client {index} is now serving {request.client.host}")
 
     if faster_client in class_cache:
         tg_connect = class_cache[faster_client]
@@ -101,14 +106,12 @@ async def media_streamer(request: web.Request, id: int, secure_hash: str):
         logging.debug(f"Creating new ByteStreamer object for client {index}")
         tg_connect = ByteStreamer(faster_client)
         class_cache[faster_client] = tg_connect
-    logging.debug("before calling get_file_properties")
     file_id = await tg_connect.get_file_properties(id)
-    logging.debug("after calling get_file_properties")
-    
+
     if file_id.unique_id[:6] != secure_hash:
         logging.debug(f"Invalid hash for message with ID {id}")
         raise InvalidHash
-    
+
     file_size = file_id.file_size
 
     if range_header:
@@ -116,8 +119,8 @@ async def media_streamer(request: web.Request, id: int, secure_hash: str):
         from_bytes = int(from_bytes)
         until_bytes = int(until_bytes) if until_bytes else file_size - 1
     else:
-        from_bytes = request.http_range.start or 0
-        until_bytes = request.http_range.stop or file_size - 1
+        from_bytes = 0
+        until_bytes = file_size - 1
 
     req_length = until_bytes - from_bytes
     new_chunk_size = await chunk_size(req_length)
@@ -125,6 +128,7 @@ async def media_streamer(request: web.Request, id: int, secure_hash: str):
     first_part_cut = from_bytes - offset
     last_part_cut = (until_bytes % new_chunk_size) + 1
     part_count = math.ceil(req_length / new_chunk_size)
+
     body = tg_connect.yield_file(
         file_id, index, offset, first_part_cut, last_part_cut, part_count, new_chunk_size
     )
@@ -132,6 +136,12 @@ async def media_streamer(request: web.Request, id: int, secure_hash: str):
     mime_type = file_id.mime_type
     file_name = file_id.file_name
     disposition = "attachment"
+
+    if str(file_id.file_type) == "FileType.PHOTO":
+        mime_type = 'image/jpeg'
+        timestamp = datetime.now().strftime("%d%m%Y%H%M%S")
+        file_name = f"{timestamp}_{secrets.token_hex(2)}.jpg"
+
     if mime_type:
         if not file_name:
             try:
@@ -140,23 +150,20 @@ async def media_streamer(request: web.Request, id: int, secure_hash: str):
                 file_name = f"{secrets.token_hex(2)}.unknown"
     else:
         if file_name:
-            mime_type = mimetypes.guess_type(file_id.file_name)
+            mime_type = mimetypes.guess_type(file_id.file_name)[0]
         else:
             mime_type = "application/octet-stream"
             file_name = f"{secrets.token_hex(2)}.unknown"
-    return_resp = web.Response(
-        status=206 if range_header else 200,
-        body=body,
-        headers={
-            "Content-Type": f"{mime_type}",
-            "Range": f"bytes={from_bytes}-{until_bytes}",
-            "Content-Range": f"bytes {from_bytes}-{until_bytes}/{file_size}",
-            "Content-Disposition": f'{disposition}; filename="{file_name}"',
-            "Accept-Ranges": "bytes",
-        },
-    )
 
-    if return_resp.status == 200:
-        return_resp.headers.add("Content-Length", str(file_size))
+    file_name = sanitize_header_value(file_name)
+    headers = {
+        "Content-Type": mime_type,
+        "Content-Range": f"bytes {from_bytes}-{until_bytes}/{file_size}",
+        "Content-Disposition": f'{disposition}; filename="{file_name}"',
+        "Accept-Ranges": "bytes",
+    }
+    logging.debug(f"Returning response for message with ID {id} and range header.")
+    return StreamingResponse(body, status_code=206 if range_header else 200, headers=headers, media_type="application/octet-stream")
 
-    return return_resp
+def sanitize_header_value(value):
+    return value.encode("ascii", errors="ignore").decode("ascii")

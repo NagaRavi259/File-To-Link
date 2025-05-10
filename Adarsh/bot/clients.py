@@ -15,7 +15,7 @@ async def initialize_clients():
     if not all_tokens:
         print("No additional clients found, using default client")
         return
-    
+
     async def start_client(client_id, token):
         try:
             print(f"Starting - Client {client_id}")
@@ -23,7 +23,7 @@ async def initialize_clients():
                 await asyncio.sleep(2)
                 print("This will take some time, please wait...")
             client = await Client(
-                name=":memory:",
+                name=f"memory_{client_id}",
                 api_id=Var.API_ID,
                 api_hash=Var.API_HASH,
                 bot_token=token,

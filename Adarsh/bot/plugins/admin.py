@@ -12,17 +12,33 @@ from Adarsh.bot import StreamBot
 from Adarsh.vars import Var
 from pyrogram import filters, Client
 from pyrogram.types import Message
-db = Database(Var.DATABASE_URL, Var.name)
+import logging
+import sys
+
+try:
+    loop = asyncio.get_event_loop()
+    db = Database(Var.DATABASE_URL, Var.name)
+    if loop.is_running():
+        # If the event loop is already running, schedule the task in it
+        task = loop.create_task(db.initialize())
+        # Optionally, handle exceptions inside the task
+        task.add_done_callback(
+            lambda t: t.exception() and logging.critical(f"Database initialization error: {t.exception()}")
+        )
+except Exception as e:
+    logging.critical(f"Critical error occurred during database initialization: {e}")
+    sys.exit(1)  # Force exit the program if database initialization fails
+
 broadcast_ids = {}
 
 @StreamBot.on_message(filters.command("users") & filters.private)
 async def sts(c: Client, m: Message):
-    user_id=m.from_user.id 
+    user_id=m.from_user.id
     if user_id in Var.OWNER_ID:
         total_users = await db.total_users_count()
         await m.reply_text(text=f"Total Users in DB: {total_users}", quote=True)
-        
-        
+
+
 @StreamBot.on_message(filters.command("broadcast") & filters.private & filters.user(list(Var.OWNER_ID)))
 async def broadcast_(c, m):
     user_id=m.from_user.id

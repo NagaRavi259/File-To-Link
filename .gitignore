@@ -16,6 +16,8 @@ eggs/
 .eggs/
 lib/
 lib64/
+test/
+logs/
 parts/
 sdist/
 var/
@@ -119,3 +121,7 @@ dmypy.json
 WebStreamer/template/new.html
 WebStreamer/template/beta.html
 WebStreamer/template/style.css
+
+# Session files
+*.session-journal
+*.session
