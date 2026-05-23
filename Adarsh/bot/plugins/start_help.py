@@ -35,21 +35,28 @@ except Exception as e:
 
 async def is_user_in_group(client, chat_id, user_id):
     """
-    Checks if a user is a member of a group.
+    Checks if a user is a member of a group.    
     Returns True if they are, False otherwise (for any reason).
     """
+    logger.info(f"Checking if user {user_id} is in group {chat_id}")
     try:
         # The core check. If this succeeds, the user is in the group.
         await client.get_chat_member(chat_id=chat_id, user_id=user_id)
+        logger.info(f"User {user_id} is in group {chat_id}")
         return True
     except UserNotParticipant:
+        logger.info(f"User {user_id} is not in group {chat_id}")
         # This is a valid, expected outcome: the user is known but not in the group.
         return False
-    except PeerIdInvalid:
-        # This means the USER_ID is unknown to the bot. Also means they are not a member.
+    except (PeerIdInvalid, ValueError) as e:
+        # This means the USER_ID or CHAT_ID is unknown to the bot.
+        # Pyrogram often raises ValueError for "Peer id invalid".
+        if "Peer id invalid" in str(e) or isinstance(e, PeerIdInvalid):
+            return False
+        logging.warning(f"An unexpected error in is_user_in_group: {e}")
         return False
     except Exception as e:
-        print(f"An unexpected error in is_user_in_group: {e}")
+        logging.warning(f"An unexpected error in is_user_in_group: {e}")
         return False
 
 @StreamBot.on_message(filters.private, group=-1)

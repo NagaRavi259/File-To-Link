@@ -210,8 +210,11 @@ class ByteStreamer:
                         break
                     if current_part == 1:
                         yield chunk[first_part_cut:]
-                    if 1 < current_part <= part_count:
+                    if 1 < current_part < part_count:
                         yield chunk
+                    elif current_part == part_count:
+                        yield chunk[:last_part_cut]
+                        break  # Last chunk done — don't fetch past end of file
 
                     r = await media_session.send(
                         raw.functions.upload.GetFile(
@@ -220,10 +223,13 @@ class ByteStreamer:
                     )
 
                     current_part += 1
-        except (TimeoutError, AttributeError):
-            pass
+        except (TimeoutError, AttributeError, OSError, asyncio.CancelledError) as e:
+            logging.warning(
+                f"Stream interrupted at part {current_part}/{part_count} "
+                f"({type(e).__name__}): {e}"
+            )
         finally:
-            logging.debug("Finished yielding file with {current_part} parts.")
+            logging.debug(f"Finished yielding file with {current_part} parts.")
             work_loads[index] -= 1
 
     

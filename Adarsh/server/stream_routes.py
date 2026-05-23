@@ -4,11 +4,11 @@
 import re
 import time
 import math
-import traceback
 import logging
 import secrets
 import mimetypes
-from fastapi import APIRouter, HTTPException, Request
+from collections import defaultdict
+from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from Adarsh.bot import multi_clients, work_loads, StreamBot
 from Adarsh.server.exceptions import FIleNotFound, InvalidHash
@@ -20,6 +20,32 @@ from Adarsh.vars import Var
 from datetime import datetime
 
 router = APIRouter()
+
+# ── Per-IP concurrent stream limiting ─────────────────────────────────────────
+# Prevents download managers with many threads from opening unlimited Telegram
+# sessions simultaneously, which causes server overload and the retry death-spiral.
+_active_streams: dict = defaultdict(int)
+MAX_STREAMS_PER_IP = 16  # Match common download manager thread counts
+
+# Maximum bytes served per open-ended range request (Range: bytes=X-).
+# Without this cap, a client sending bytes=0- on a 4GB file causes a
+# 4,000-step Telegram GetFile loop that runs for hours, monopolising one
+# bot client and starving all other parallel connections of the same download.
+# 100 MB = ~100 sequential Telegram calls (~15 seconds max per generator).
+# Fully RFC-7233 compliant: client reads Content-Range to learn total size
+# and issues follow-up range requests automatically.
+MAX_OPEN_RANGE = 100 * 1024 * 1024  # 100 MB
+
+
+async def _tracked_body(generator, ip: str):
+    """Wrap yield_file so the active stream counter is decremented when the
+    body finishes streaming — not just when the StreamingResponse is created."""
+    try:
+        async for chunk in generator:
+            yield chunk
+    finally:
+        _active_streams[ip] -= 1
+
 
 # Root route for server status
 @router.get("/", response_class=JSONResponse)
@@ -40,24 +66,84 @@ async def root_route_handler():
         }
     )
 
+
 @router.get("/watch/{path:path}", response_class=HTMLResponse)
-async def stream_handler(request: Request, path: str):
+async def watch_handler(request: Request, path: str):
     try:
         match = re.search(r"^([a-zA-Z0-9_-]{6})(\d+)$", path)
         if match:
             secure_hash = match.group(1)
             id = int(match.group(2))
         else:
-            id = int(re.search(r"(\d+)(?:/\S+)?", path).group(1))
-            secure_hash = request.query_params.get("hash")
+            match = re.search(r"(\d+)(?:/\S+)?", path)
+            if match:
+                id = int(match.group(1))
+                secure_hash = request.query_params.get("hash")
+            else:
+                raise HTTPException(status_code=400, detail="Invalid path format")
         return HTMLResponse(content=await render_page(id, secure_hash))
+    except HTTPException as e:
+        raise e
     except InvalidHash as e:
         raise HTTPException(status_code=403, detail=e.message)
     except FIleNotFound as e:
         raise HTTPException(status_code=404, detail=e.message)
     except Exception as e:
-        logging.critical(e.with_traceback(None))
-        raise HTTPException(status_code=500, detail=str(e))
+        logging.error(f"Unexpected error in watch_handler: {e}")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
+
+# ── HEAD handler ───────────────────────────────────────────────────────────────
+# aria2c and most download managers send HEAD before GET to discover file size.
+# Without this, the server returns 405 and the client falls back to CN:1
+# (single connection), completely defeating multi-threaded downloading.
+@router.head("/{path:path}")
+async def head_handler(request: Request, path: str):
+    """Return file metadata headers without body for download manager probing."""
+    try:
+        match = re.search(r"^([a-zA-Z0-9_-]{6})(\d+)$", path)
+        if match:
+            secure_hash = match.group(1)
+            id = int(match.group(2))
+        else:
+            match = re.search(r"(\d+)(?:/(\S+))?", path)
+            if match:
+                id = int(match.group(1))
+                secure_hash = request.query_params.get("hash")
+            else:
+                raise HTTPException(status_code=400, detail="Invalid path format")
+
+        # Reuse ByteStreamer cache to get file metadata
+        index = min(work_loads, key=work_loads.get)
+        faster_client = multi_clients[index]
+        if faster_client in class_cache:
+            tg_connect = class_cache[faster_client]
+        else:
+            tg_connect = ByteStreamer(faster_client)
+            class_cache[faster_client] = tg_connect
+
+        file_id = await tg_connect.get_file_properties(id)
+        if file_id.unique_id[:6] != secure_hash:
+            raise HTTPException(status_code=403, detail="Invalid hash")
+
+        file_size = file_id.file_size
+        mime_type = file_id.mime_type or "application/octet-stream"
+        file_name = sanitize_header_value(file_id.file_name or secrets.token_hex(4))
+
+        return Response(
+            status_code=200,
+            headers={
+                "Content-Type": mime_type,
+                "Content-Length": str(file_size),
+                "Accept-Ranges": "bytes",
+                "Content-Disposition": f'attachment; filename="{file_name}"',
+            },
+        )
+    except HTTPException as e:
+        raise e
+    except (InvalidHash, Exception) as e:
+        raise HTTPException(status_code=404, detail="File not found")
+
 
 @router.get("/{path:path}")
 async def stream_handler(request: Request, path: str):
@@ -67,37 +153,50 @@ async def stream_handler(request: Request, path: str):
             secure_hash = match.group(1)
             id = int(match.group(2))
         else:
-            # id = int(re.search(r"(\d+)(?:/\S+)?", path).group(1))
             match = re.search(r"(\d+)(?:/(\S+))?", path)
             if match:
                 id = int(match.group(1))
                 secure_hash = request.query_params.get("hash")
             else:
                 raise HTTPException(status_code=400, detail="Invalid path format")
-            # secure_hash = request.query_params.get("hash")
         return await media_streamer(request, id, secure_hash)
+    except HTTPException as e:
+        raise e
     except InvalidHash as e:
         raise HTTPException(status_code=403, detail=e.message)
     except FIleNotFound as e:
         raise HTTPException(status_code=404, detail=e.message)
     except Exception as e:
-        print(e)
-        # Get the traceback and extract the line number
-        traceback_details = traceback.format_exc()
-        print(f"Traceback details:\n{traceback_details}")
-        logging.critical(e.with_traceback(None))
-        raise HTTPException(status_code=500, detail=str(e))
+        logging.error(f"Unexpected error in stream_handler: {e}")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
 
 class_cache = {}
 
+
 async def media_streamer(request: Request, id: int, secure_hash: str):
-    range_header = request.headers.get("range", 0)
-    # Get the index of the faster client
+    range_header = request.headers.get("range", None)
+
+    # Resolve client IP
+    client_host = request.client.host if request.client else "unknown"
+
+    # ── Per-IP concurrency gate ────────────────────────────────────────────────
+    if client_host != "unknown" and _active_streams[client_host] >= MAX_STREAMS_PER_IP:
+        msg = f"IP {client_host} hit concurrent stream limit ({MAX_STREAMS_PER_IP}), returning 429"
+        logging.warning(msg)
+        print(msg, flush=True)
+        raise HTTPException(
+            status_code=429,
+            detail="Too many concurrent connections. Please slow down.",
+            headers={"Retry-After": "2"},
+        )
+
+    # Get the index of the least-loaded client
     index = min(work_loads, key=work_loads.get)
     faster_client = multi_clients[index]
 
     if Var.MULTI_CLIENT:
-        logging.info(f"Client {index} is now serving {request.client.host}")
+        logging.info(f"Client {index} is now serving {client_host}")
 
     if faster_client in class_cache:
         tg_connect = class_cache[faster_client]
@@ -106,6 +205,7 @@ async def media_streamer(request: Request, id: int, secure_hash: str):
         logging.debug(f"Creating new ByteStreamer object for client {index}")
         tg_connect = ByteStreamer(faster_client)
         class_cache[faster_client] = tg_connect
+
     file_id = await tg_connect.get_file_properties(id)
 
     if file_id.unique_id[:6] != secure_hash:
@@ -115,30 +215,47 @@ async def media_streamer(request: Request, id: int, secure_hash: str):
     file_size = file_id.file_size
 
     if range_header:
-        from_bytes, until_bytes = range_header.replace("bytes=", "").split("-")
+        from_bytes, until_str = range_header.replace("bytes=", "").split("-")
         from_bytes = int(from_bytes)
-        until_bytes = int(until_bytes) if until_bytes else file_size - 1
+        if until_str:
+            # Explicit upper bound — honour exactly
+            until_bytes = int(until_str)
+        else:
+            # Open-ended (bytes=X-): cap to MAX_OPEN_RANGE so the generator
+            # never runs more than ~100 Telegram GetFile calls per connection.
+            # The client sees the real file size in Content-Range and
+            # automatically requests the next segment.
+            until_bytes = min(file_size - 1, from_bytes + MAX_OPEN_RANGE - 1)
+            logging.debug(
+                f"Open-ended range capped: bytes={from_bytes}-{until_bytes} "
+                f"(of {file_size}) for message {id}"
+            )
     else:
         from_bytes = 0
-        until_bytes = file_size - 1
+        until_bytes = min(file_size - 1, MAX_OPEN_RANGE - 1)
 
-    req_length = until_bytes - from_bytes
+    # Clamp to actual file bounds (safety guard)
+    until_bytes = min(until_bytes, file_size - 1)
+
+    req_length = until_bytes - from_bytes + 1
     new_chunk_size = await chunk_size(req_length)
     offset = await offset_fix(from_bytes, new_chunk_size)
     first_part_cut = from_bytes - offset
     last_part_cut = (until_bytes % new_chunk_size) + 1
-    part_count = math.ceil(req_length / new_chunk_size)
+    part_count = max(1, math.ceil(req_length / new_chunk_size))
 
-    body = tg_connect.yield_file(
+    raw_body = tg_connect.yield_file(
         file_id, index, offset, first_part_cut, last_part_cut, part_count, new_chunk_size
     )
+    _active_streams[client_host] += 1
+    body = _tracked_body(raw_body, client_host)
 
     mime_type = file_id.mime_type
     file_name = file_id.file_name
     disposition = "attachment"
 
     if str(file_id.file_type) == "FileType.PHOTO":
-        mime_type = 'image/jpeg'
+        mime_type = "image/jpeg"
         timestamp = datetime.now().strftime("%d%m%Y%H%M%S")
         file_name = f"{timestamp}_{secrets.token_hex(2)}.jpg"
 
@@ -156,14 +273,28 @@ async def media_streamer(request: Request, id: int, secure_hash: str):
             file_name = f"{secrets.token_hex(2)}.unknown"
 
     file_name = sanitize_header_value(file_name)
+
+    # ── Response headers for download managers ───────────────────────────────
+    # We deliberately omit Content-Length from StreamingResponse.
+    # Starlette's built-in ServerErrorMiddleware (un-removable) wraps every
+    # streaming response and sends a final empty body b"" when the stream ends.
+    # Content-Length is required for aria2c/IDM to open parallel connections.
+    # When Telegram times out mid-stream (fewer bytes sent than promised),
+    # uvicorn raises RuntimeError("Response content shorter than Content-Length").
+    # This is caught in BlockAbuseMiddleware.send_interceptor before it can
+    # reach Starlette's error handler, so it won't crash or spam the error log.
+    # The client's download manager simply retries the failed segment.
+    status_code = 206 if range_header else 200
     headers = {
         "Content-Type": mime_type,
+        "Content-Length": str(req_length),
         "Content-Range": f"bytes {from_bytes}-{until_bytes}/{file_size}",
-        "Content-Disposition": f'{disposition}; filename="{file_name}"',
+        "Content-Disposition": f'attachment; filename="{file_name}"',
         "Accept-Ranges": "bytes",
     }
-    logging.debug(f"Returning response for message with ID {id} and range header.")
-    return StreamingResponse(body, status_code=206 if range_header else 200, headers=headers, media_type="application/octet-stream")
+    logging.debug(f"Returning {status_code} for message ID {id}, range {from_bytes}-{until_bytes}/{file_size}")
+    return StreamingResponse(body, status_code=status_code, headers=headers, media_type=mime_type)
+
 
 def sanitize_header_value(value):
     return value.encode("ascii", errors="ignore").decode("ascii")
