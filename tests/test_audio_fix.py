@@ -57,7 +57,7 @@ async def main():
     from Adarsh.utils.access import access_db as _access_db
     install_fakes(_access_db)
     from Adarsh.server import stream_routes as sr
-    from Adarsh.utils import audio_fix
+    from Adarsh.utils import audio_fix, render_template
     from Adarsh.utils.custom_dl import ByteStreamer
     from Adarsh.bot import work_loads, multi_clients
     from Adarsh.vars import Var
@@ -69,18 +69,29 @@ async def main():
         assert fine not in audio_fix.UNSUPPORTED_AUDIO_CODECS, fine
     print("U1 ok: unsupported-codec list contains the Dolby/DTS set, not ordinary codecs")
 
-    # ---------- unit: concurrency gate
+    # ---------- unit: concurrency gate (fully synchronous: see the module docstring on why —
+    # a cancelled cleanup must never be able to skip releasing a slot)
     audio_fix._gate = None  # force a fresh gate at the test's MAX_CONCURRENT_AUDIO_FIX=1
-    await audio_fix.begin_transcode()
+    audio_fix.begin_transcode()
     try:
-        await audio_fix.begin_transcode()
+        audio_fix.begin_transcode()
         raise SystemExit("second begin_transcode should have raised TranscodeBusy")
     except audio_fix.TranscodeBusy:
         pass
-    await audio_fix.end_transcode()
-    await audio_fix.begin_transcode()  # slot freed, should succeed again
-    await audio_fix.end_transcode()
+    audio_fix.end_transcode()
+    audio_fix.begin_transcode()  # slot freed, should succeed again
+    audio_fix.end_transcode()
     print("U2 ok: concurrency gate enforces MAX_CONCURRENT_AUDIO_FIX and frees slots")
+
+    # ---------- unit: force=True/False bypass probing entirely and skip the cache
+    real_exec = asyncio.create_subprocess_exec  # captured before any monkeypatching below
+    real_tools_available = audio_fix.tools_available
+    audio_fix.clear_probe_cache()
+    asyncio.create_subprocess_exec = None  # force=True/False must never spawn ffprobe
+    assert await audio_fix.get_audio_fix_plan(201, "h", force=False) == audio_fix.NO_FIX_PLAN
+    assert await audio_fix.get_audio_fix_plan(201, "h", force=True) == audio_fix.FORCED_FIX_PLAN
+    assert 201 not in audio_fix._probe_cache  # forced results are never cached
+    print("U2b ok: force=True/False short-circuit probing deterministically, uncached")
 
     # ---------- unit: get_audio_fix_plan, mocked ffprobe (no real process)
     audio_fix.clear_probe_cache()
@@ -94,8 +105,6 @@ async def main():
             return P()
         return fake_exec
 
-    real_exec = asyncio.create_subprocess_exec
-    real_tools_available = audio_fix.tools_available
     audio_fix.tools_available = lambda: True
 
     # default-flagged E-AC3 track should be picked over a non-default AAC track that sorts first
@@ -139,20 +148,72 @@ async def main():
     audio_fix.tools_available = real_tools_available
     audio_fix.clear_probe_cache()
 
+    # ---------- unit: the transcode slot is released even when the stream is cancelled mid-read
+    # (the actual bug that caused "worked once, never again" in production: an async-lock-based
+    # gate release could itself be skipped by cancellation, permanently wedging every slot).
+    class FakeStream:
+        async def read(self, n):
+            await asyncio.sleep(3600)  # never produces data on its own
+        async def readline(self):
+            await asyncio.sleep(3600)
+
+    class FakeProc:
+        def __init__(self):
+            self.stdout = FakeStream()
+            self.stderr = FakeStream()
+            self.returncode = None
+            self.pid = -1
+        def kill(self):
+            self.returncode = -9
+        async def wait(self):
+            return self.returncode
+
+    class FakeRequest:
+        async def is_disconnected(self):
+            return False
+
+    audio_fix._gate = None
+    audio_fix.begin_transcode()
+    assert audio_fix._gate._count == 1
+    gen = audio_fix.stream_ffmpeg_output(FakeProc(), FakeRequest(), 999)
+    task = asyncio.ensure_future(gen.__anext__())
+    await asyncio.sleep(0.1)  # let it reach the stdout.read() await
+    task.cancel()
+    try:
+        await task
+        raise SystemExit("expected the cancelled task to raise CancelledError")
+    except asyncio.CancelledError:
+        pass
+    assert audio_fix._gate._count == 0, "transcode slot leaked after cancellation"
+    print("U8 ok: the transcode slot is freed even when the stream is cancelled mid-read")
+
     if not HAVE_FFMPEG:
         print("SKIP: real ffmpeg/ffprobe not found on PATH, skipping the end-to-end check")
         return
 
     # ---------- end-to-end: real ffmpeg fixture, real server, real ffprobe/ffmpeg round trip
+    FIXTURE_DURATION = 30  # seconds; short fixtures (e.g. 12s) are NOT safe here — confirmed by
+    # direct experimentation that ffmpeg's demuxer seek doesn't meaningfully engage below some
+    # file-size/duration threshold and just reads the whole tiny file regardless of -ss, which
+    # looks exactly like a broken seek but is purely a too-short-fixture artifact. 30s is safely
+    # above that threshold (verified directly) without making the fixture slow to generate.
+    KEYFRAME_INTERVAL = 3  # seconds; realistically sparse (not 1s), so a seek that lands well
+    # inside a GOP (not exactly on a keyframe) is actually possible to construct and test
     tmp_dir = tempfile.mkdtemp(prefix="ftl-audiofix-")
     fixture_path = os.path.join(tmp_dir, "fixture.mkv")
     subprocess.run(
         [
             "ffmpeg", "-y", "-v", "error",
-            "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=10:duration=2",
-            "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+            "-f", "lavfi", "-i", f"testsrc2=size=320x240:rate=10:duration={FIXTURE_DURATION}",
+            "-f", "lavfi", "-i", f"sine=frequency=440:duration={FIXTURE_DURATION}",
+            "-f", "lavfi", "-i", f"sine=frequency=523:duration={FIXTURE_DURATION}",
+            "-map", "0:v", "-map", "1:a", "-map", "2:a",
             "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-g", str(KEYFRAME_INTERVAL * 10), "-keyint_min", str(KEYFRAME_INTERVAL * 10),
             "-c:a", "eac3", "-b:a", "192k",
+            "-metadata:s:a:0", "language=eng", "-metadata:s:a:0", "title=English",
+            "-metadata:s:a:1", "language=tel", "-metadata:s:a:1", "title=Telugu",
+            "-disposition:a:0", "default", "-disposition:a:1", "0",
             "-f", "matroska", fixture_path,
         ],
         check=True,
@@ -252,6 +313,142 @@ async def main():
         assert r3.headers.get("content-type") == "video/x-matroska", r3.headers
         assert r3.content == fixture_bytes
         print("E5 ok: the internal-call marker header bypasses the fix branch (no recursion)")
+
+        # ?audiofix=0 must force the plain original through, even though auto-detect would fix it
+        r4 = requests.get(f"{base}/{msg_id}?hash={secure_hash}&audiofix=0", timeout=30)
+        assert r4.status_code == 200
+        assert r4.headers.get("content-type") == "video/x-matroska", r4.headers
+        assert r4.content == fixture_bytes
+        print("E6 ok: ?audiofix=0 forces the original (unfixed) stream, for comparison")
+
+        # ?audiofix=1 must force the fixed version through deterministically
+        r5 = requests.get(f"{base}/{msg_id}?hash={secure_hash}&audiofix=1", timeout=30)
+        assert r5.status_code == 200
+        assert r5.headers.get("content-type") == "video/mp4", r5.headers
+        assert len(r5.content) > 1000
+        print("E7 ok: ?audiofix=1 forces the fixed stream, for comparison")
+
+        # ---------- duration + track-list probing (what makes the seek-capable player's bar and
+        # language picker correct)
+        media_info = await audio_fix.probe_media_info(msg_id, secure_hash)
+        assert media_info is not None
+        duration = media_info["duration"]
+        assert duration is not None and abs(duration - FIXTURE_DURATION) < 0.5, duration
+        tracks = media_info["audio_tracks"]
+        assert [t["language"] for t in tracks] == ["eng", "tel"], tracks
+        assert tracks[0]["default"] is True and tracks[1]["default"] is False, tracks
+        assert all(t["codec"] == "eac3" for t in tracks), tracks
+        assert media_info["video_width"] == 320 and media_info["video_height"] == 240, media_info
+        print(f"E8 ok: probe_media_info reports ~{duration:.1f}s duration and both audio tracks correctly")
+
+        # ---------- ?start=N actually seeks: output should cover roughly [N, duration], not the
+        # whole file again (the actual feature being added here, no disk cache: a seek just
+        # starts a fresh transcode from the requested point).
+        # Not seek_to=3: confirmed directly that ffmpeg has a sensible optimization where a seek
+        # target shallow enough to already be covered by its initial format-probe read (here,
+        # under ~5s) just reuses that buffered data instead of re-seeking — harmless in practice
+        # (nobody seeks to second 3 of a 2-hour movie) but not what this check is testing for.
+        seek_to = 12
+        r6 = requests.get(f"{base}/{msg_id}?hash={secure_hash}&audiofix=1&start={seek_to}", timeout=30)
+        assert r6.status_code == 200 and r6.headers.get("content-type") == "video/mp4"
+        seek_out_path = os.path.join(tmp_dir, "seek_out.mp4")
+        with open(seek_out_path, "wb") as f:
+            f.write(r6.content)
+        # format.duration is NOT used here: it's unreliable for frag_keyframe+empty_moov output
+        # (that mode intentionally omits a real duration from the moov box, for streaming; ffprobe
+        # falls back to a bitrate-based *estimate* that doesn't reflect the real seeked content
+        # span — confirmed by direct ffmpeg experimentation, not a guess). Actual per-packet
+        # timestamps are what's real; span them directly instead.
+        def packet_pts_list(path, stream):
+            p = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", stream, "-show_entries", "packet=pts_time",
+                 "-of", "csv=p=0", path],
+                capture_output=True, check=True, text=True,
+            )
+            return [float(x) for x in p.stdout.strip().splitlines() if x.strip()]
+
+        v_pts = packet_pts_list(seek_out_path, "v:0")
+        seek_span = v_pts[-1] - v_pts[0]
+        expected_remaining = FIXTURE_DURATION - seek_to
+        # Fast (-noaccurate_seek) seeking snaps to the nearest *preceding* keyframe — up to one
+        # full keyframe interval earlier than requested is correct, documented behavior, not
+        # imprecision to tighten away. The tolerance reflects that, not an exact match.
+        assert abs(seek_span - expected_remaining) < KEYFRAME_INTERVAL + 1, (seek_span, expected_remaining, v_pts[0], v_pts[-1])
+        decode2 = subprocess.run(["ffmpeg", "-v", "error", "-i", seek_out_path, "-f", "null", "-"], capture_output=True)
+        assert decode2.returncode == 0 and decode2.stderr == b"", decode2.stderr
+        print(f"E9 ok: ?start={seek_to} yields ~{seek_span:.1f}s of real video content (expected ~{expected_remaining}s), decodes cleanly")
+
+        # ---------- audio/video stay aligned at a seek point that does NOT land on a keyframe.
+        # Keyframes are every KEYFRAME_INTERVAL (3s) at 0/3/6/9s; seeking to 5.5s lands well inside
+        # the 3-6s GOP, 2.5s past the nearest keyframe. Without -noaccurate_seek, video snaps to
+        # the keyframe at 3s while audio (decoded/re-encoded) gets trimmed to land exactly on
+        # 5.5s — a ~2.5s gap, easily big enough to look exactly like the reported "audio lag
+        # after seeking". Seeking to an exact keyframe would pass even without the fix, so
+        # wouldn't actually be testing anything.
+        seek_offset = KEYFRAME_INTERVAL * 2 + KEYFRAME_INTERVAL / 2  # = 7.5s here; mid-GOP (6-9s)
+        r7 = requests.get(f"{base}/{msg_id}?hash={secure_hash}&audiofix=1&start={seek_offset}", timeout=30)
+        assert r7.status_code == 200
+        offbeat_path = os.path.join(tmp_dir, "offbeat_seek.mp4")
+        with open(offbeat_path, "wb") as f:
+            f.write(r7.content)
+
+        def first_packet_pts(path, stream):
+            p = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", stream, "-show_entries", "packet=pts_time",
+                 "-of", "csv=p=0", path],
+                capture_output=True, check=True, text=True,
+            )
+            return float(p.stdout.strip().splitlines()[0])
+
+        first_video_pts = first_packet_pts(offbeat_path, "v:0")
+        first_audio_pts = first_packet_pts(offbeat_path, "a:0")
+        av_gap = abs(first_video_pts - first_audio_pts)
+        # Without -noaccurate_seek this would be ~1.5s (audio trimmed exactly to 7.5s, video
+        # snapped to the 6s keyframe) — a tight tolerance here is the point of the test.
+        assert av_gap < 0.5, f"audio/video start {av_gap:.2f}s apart (video={first_video_pts}, audio={first_audio_pts})"
+        print(f"E12 ok: seeking to a non-keyframe point ({seek_offset}s) keeps audio/video aligned (gap {av_gap:.2f}s)")
+
+        # ---------- ?atrack=1 picks the second (Telugu) audio track instead of the default (eng),
+        # and always routes through the fixed pipeline regardless of ?audiofix
+        r8 = requests.get(f"{base}/{msg_id}?hash={secure_hash}&atrack=1", timeout=30)
+        assert r8.status_code == 200 and r8.headers.get("content-type") == "video/mp4"
+        atrack_path = os.path.join(tmp_dir, "atrack.mp4")
+        with open(atrack_path, "wb") as f:
+            f.write(r8.content)
+        atrack_probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-print_format", "json", "-show_streams", atrack_path],
+            capture_output=True, check=True,
+        )
+        atrack_streams = json.loads(atrack_probe.stdout)["streams"]
+        atrack_audio = next(s for s in atrack_streams if s["codec_type"] == "audio")
+        assert atrack_audio["codec_name"] == "aac"  # still fixed, just the other source track
+        print("E13 ok: ?atrack=1 switches to the second audio track through the same fixed pipeline")
+
+        # ---------- the watch page uses the seek-capable custom player when the fix applies,
+        # and the plain Plyr-based page when it's forced off
+        async def get_file_ids(client, chat, mid):
+            return file_id
+        render_template.get_file_ids = get_file_ids
+
+        watch_fixed = requests.get(f"{base}/watch/{msg_id}/?hash={secure_hash}&audiofix=1", timeout=30)
+        assert watch_fixed.status_code == 200
+        body = watch_fixed.text
+        assert "audio-fix player" not in body  # sanity: not literally searching for our own comment
+        assert "var totalDuration" in body and "var baseStreamUrl" in body
+        assert f"start=' + encodeURIComponent" in body  # the seek-reload logic is present
+        assert f"&amp;audiofix=1" not in body  # the embedded stream URL must be the raw (unescaped) one
+        assert "&audiofix=1" in body
+        assert "var audioTracks" in body and "var currentTrackIndex" in body
+        assert '"language": "eng"' in body and '"language": "tel"' in body
+        assert "var currentTrackIndex = 0;" in body  # eng is the disposition-default track
+        assert 'style="aspect-ratio: 320 / 240;"' in body  # real probed resolution, not a guess
+        print("E10 ok: watch page renders the seek-capable custom player with both audio tracks")
+
+        watch_plain = requests.get(f"{base}/watch/{msg_id}/?hash={secure_hash}&audiofix=0", timeout=30)
+        assert watch_plain.status_code == 200
+        assert "var totalDuration" not in watch_plain.text
+        assert "plyr" in watch_plain.text.lower()
+        print("E11 ok: watch page falls back to the plain player when ?audiofix=0 forces the fix off")
     finally:
         server.should_exit = True
         thread.join(timeout=10)
